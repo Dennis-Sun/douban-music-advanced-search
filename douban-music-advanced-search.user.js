@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         豆瓣音乐高级搜索
 // @namespace    https://music.douban.com/advanced-search
-// @version      1.0.1
-// @description  在豆瓣音乐搜索框旁增加「高级搜索」：支持按作品名 / 表演者 / 年份 / 流派对音乐条目进行精确过滤（包含 / 精确两种匹配模式，支持多年份与年份区间，登录后自动翻页加载全部结果）
+// @version      1.1.0
+// @description  在豆瓣音乐搜索框旁增加「高级搜索」：支持按作品名 / 表演者 / 年份 / 流派对音乐条目进行精确过滤（包含 / 精确两种匹配模式，支持多年份与年份区间，自动翻页加载全部结果）。同时支持 music.douban.com 与新版搜索页 search.douban.com/music/subject_search
 // @author       Dennis
 // @match        https://music.douban.com/*
+// @match        https://search.douban.com/music/subject_search*
 // @match        https://www.douban.com/search*
 // @run-at       document-end
 // @noframes
@@ -165,11 +166,118 @@
     return out;
   }
 
+  /* ---------------------------------------------------------------------
+   * 新版搜索页（search.douban.com/music/subject_search）的数据结构
+   * 服务端把结果 JSON 直接注入 window.__DATA__，每条 abstract 形如：
+   *   表演者 / 发行日期 / 版本特性 / 介质 / 流派
+   * 其中日期、流派内部可能自带斜杠（2003/11/11、放克/灵歌/R&B），
+   * 但字段分隔符固定是「空格 + 斜杠 + 空格」，因此不会被切坏。
+   * ------------------------------------------------------------------- */
+
+  /** 介质取值（用于判断末段是不是流派） */
+  const MEDIA_WORDS = new Set([
+    'cd', 'dvd', 'dvd5', 'dvd9', 'vcd', 'ld', 'lp', 'sacd', 'hdcd', 'xrcd',
+    '磁带', '卡带', '黑胶', '光盘', '数字', '数字(digital)', 'digital',
+    'audio cd', 'audiocd', 'musiccd', '音乐cd', '音乐cd', 'cd+dvd', 'cd+vcd',
+    'dvd+cd', '数字媒体', 'digital media', '蓝光', 'blu-ray', 'umd', 'md',
+  ]);
+  /** 版本特性取值（用于判断首段是不是表演者） */
+  const VERSION_WORDS = new Set([
+    '专辑', '单曲', '选集', '精选', '合辑', '套装', 'ep', 'box set', 'boxset',
+    'import', '进口', '录音室专辑', '现场专辑', 'live', '再版', '重制版', '重制',
+    'remaster', 'remastered', '限量版', '豪华版', 'deluxe', 'anniversary',
+    'edition', 'version', '影音', '演唱会', '视频', 'mv', 'ost', '原声带',
+  ]);
+  const DATE_RE = /^\d{4}\s*[年\-\.\/]?/;
+
+  const isMedia = (s) => MEDIA_WORDS.has(String(s || '').trim().toLowerCase());
+  const isVersion = (s) => VERSION_WORDS.has(String(s || '').trim().toLowerCase());
+
+  /**
+   * 解析新版搜索页的 abstract 字段
+   * @param {string} text
+   * @returns {{performer:string, date:string, year:string, genre:string}}
+   */
+  function parseSpaAbstract(text) {
+    const out = { performer: '', date: '', year: '', genre: '' };
+    if (!text) return out;
+    const parts = String(text).split(/\s+\/\s+/).map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return out;
+
+    // 1) 定位日期段
+    let dateIdx = -1;
+    for (let i = 0; i < parts.length; i++) {
+      if (DATE_RE.test(parts[i])) { dateIdx = i; break; }
+    }
+
+    // 2) 表演者：日期段之前的全部（无日期时看首段是否像表演者）
+    if (dateIdx > 0) {
+      out.performer = parts.slice(0, dateIdx).join(' / ');
+    } else if (dateIdx === -1) {
+      const first = parts[0];
+      if (!isVersion(first) && !isMedia(first)) out.performer = first;
+    }
+    if (dateIdx >= 0) {
+      out.date = parts[dateIdx];
+      const ym = out.date.match(/\d{4}/);
+      if (ym) out.year = ym[0];
+    }
+
+    // 3) 尾段是否流派：介质结尾则说明没写流派
+    const tail = dateIdx >= 0 ? parts.slice(dateIdx + 1) : (out.performer ? parts.slice(1) : parts);
+    if (tail.length) {
+      const last = tail[tail.length - 1];
+      if (!isMedia(last)) {
+        if (tail.length >= 2 || !isVersion(last)) out.genre = last;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 把 __DATA__ 里的一条原始数据转成统一结构
+   * @returns {null|{title, link, cover, rating, votes, performer, genre, year, date, abstract}}
+   */
+  function parseSpaItem(raw) {
+    if (!raw || !raw.url || !raw.title) return null;
+    // 只保留音乐条目，排除音乐人 / 艺术家等非条目结果
+    if (raw.tpl_name && raw.tpl_name !== 'search_subject') return null;
+    if (!/\/subject\//.test(raw.url)) return null;
+    const a = parseSpaAbstract(raw.abstract || '');
+    const r = raw.rating || {};
+    const value = typeof r.value === 'number' ? r.value : parseFloat(r.value);
+    return {
+      title: String(raw.title).replace(/\s+/g, ' ').trim(),
+      link: raw.url,
+      cover: raw.cover_url || '',
+      rating: value > 0 ? value.toFixed(1) : '',
+      votes: r.count ? String(r.count) : '',
+      performer: a.performer,
+      genre: a.genre,
+      year: a.year,
+      date: a.date,
+      abstract: raw.abstract || '',
+    };
+  }
+
+  /** 从新版搜索页 HTML 中抠出 window.__DATA__ */
+  function extractSpaData(html) {
+    if (!html) return null;
+    const m = /window\.__DATA__\s*=\s*(\{[\s\S]*?\})\s*;/.exec(html);
+    if (!m) return null;
+    try {
+      return JSON.parse(m[1]);
+    } catch (e) {
+      return null;
+    }
+  }
+
   /** 暴露核心逻辑，便于控制台调试与自动化测试 */
   const API = {
     normContains, normExact, matchText, parseYearSet, itemYear,
     parseCast, itemMatches, decodeLink2, extractItem, nodesFromHtml,
-    buildSearchUrl,
+    buildSearchUrl, buildSpaSearchUrl,
+    parseSpaAbstract, parseSpaItem, extractSpaData,
   };
   if (typeof window !== 'undefined') window.__DBMAS__ = API;
 
@@ -246,6 +354,34 @@
 #dbmas-bar .dbmas-warn { color: #c0392b; margin-top: 6px; }
 #dbmas-bar form.dbmas-inline { margin-top: 12px; border-top: 1px dashed #d5e8d5; padding-top: 12px; }
 
+/* 新版搜索页：自绘结果列表 */
+#dbmas-spa { margin: 0 0 24px; }
+#dbmas-spa .dbmas-spa-list {
+  border-top: 1px solid #eee;
+}
+#dbmas-spa .dbmas-spa-card {
+  display: flex; gap: 16px; padding: 16px 0; border-bottom: 1px solid #eee;
+}
+#dbmas-spa .dbmas-spa-cover {
+  flex: none; width: 80px; height: 80px; overflow: hidden;
+  background: #f6f6f6; border-radius: 3px; display: block;
+}
+#dbmas-spa .dbmas-spa-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#dbmas-spa .dbmas-spa-nocover {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%; color: #bbb; font-size: 12px;
+}
+#dbmas-spa .dbmas-spa-body { min-width: 0; }
+#dbmas-spa .dbmas-spa-title { font-size: 15px; line-height: 1.4; margin-bottom: 4px; }
+#dbmas-spa .dbmas-spa-title a { color: #37a; text-decoration: none; }
+#dbmas-spa .dbmas-spa-title a:hover { color: #fff; background: #37a; }
+#dbmas-spa .dbmas-spa-meta { font-size: 13px; color: #007722; margin-bottom: 3px; }
+#dbmas-spa .dbmas-spa-abs { font-size: 12px; color: #999; line-height: 1.5; }
+#dbmas-spa .dbmas-spa-rating { font-size: 12px; color: #666; margin-top: 4px; }
+#dbmas-spa .dbmas-spa-rating b { color: #e09015; font-size: 13px; margin-right: 6px; }
+#dbmas-spa .dbmas-norating { color: #bbb; }
+#dbmas-spa .dbmas-empty { padding: 28px 0; color: #999; font-size: 13px; }
+
 @media (prefers-color-scheme: dark) {
   .dbmas-panel { background: #1f1f1f; border-color: #3a3a3a; color: #ddd; }
   .dbmas-panel h3 { color: #6fbf73; }
@@ -256,6 +392,12 @@
   #dbmas-bar .dbmas-bar-title { color: #6fbf73; }
   #dbmas-bar .dbmas-chip { background: #243122; border-color: #3c5a3e; color: #9ecfa0; }
   #dbmas-bar .dbmas-chip b { color: #7ecf87; }
+  #dbmas-spa .dbmas-spa-list, #dbmas-spa .dbmas-spa-card { border-color: #333; }
+  #dbmas-spa .dbmas-spa-cover { background: #2b2b2b; }
+  #dbmas-spa .dbmas-spa-title a { color: #7cb7e0; }
+  #dbmas-spa .dbmas-spa-title a:hover { background: #7cb7e0; color: #1f1f1f; }
+  #dbmas-spa .dbmas-spa-meta { color: #7ecf87; }
+  #dbmas-spa .dbmas-empty { color: #888; }
 }
 `;
 
@@ -271,8 +413,10 @@
    * ===================================================================== */
 
   const SEARCH_URL = 'https://www.douban.com/search';
+  const SPA_SEARCH_URL = 'https://search.douban.com/music/subject_search';
+  const SPA_SEARCH_PATH = '/music/subject_search';
 
-  /** 由条件生成跳转地址 */
+  /** 由条件生成跳转地址（旧版 www.douban.com/search） */
   function buildSearchUrl(c) {
     const p = new URLSearchParams();
     const qParts = [];
@@ -287,6 +431,23 @@
     p.set('adv_tmode', c.tmode === 'exact' ? 'exact' : 'contains');
     p.set('adv_pmode', c.pmode === 'exact' ? 'exact' : 'contains');
     return SEARCH_URL + '?' + p.toString();
+  }
+
+  /** 由条件生成跳转地址（新版 search.douban.com/music/subject_search） */
+  function buildSpaSearchUrl(c) {
+    const p = new URLSearchParams();
+    const qParts = [];
+    if (c.title) qParts.push(c.title.trim());
+    if (c.performer) qParts.push(c.performer.trim());
+    p.set('search_text', qParts.join(' ').trim());
+    p.set('cat', '1003');
+    if (c.title) p.set('adv_title', c.title.trim());
+    if (c.performer) p.set('adv_performer', c.performer.trim());
+    if (c.year) p.set('adv_year', c.year.trim());
+    if (c.genre) p.set('adv_genre', c.genre.trim());
+    p.set('adv_tmode', c.tmode === 'exact' ? 'exact' : 'contains');
+    p.set('adv_pmode', c.pmode === 'exact' ? 'exact' : 'contains');
+    return SPA_SEARCH_URL + '?' + p.toString();
   }
 
   /**
@@ -370,8 +531,15 @@
       .replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  /** 在一个搜索输入框旁边挂上「高级」入口和下拉面板 */
-  function mountAdvancedToggle(inputEl, anchorEl) {
+  /**
+   * 在一个搜索输入框旁边挂上「高级」入口和下拉面板
+   * @param {Element} inputEl
+   * @param {Element} anchorEl
+   * @param {object} [opts] { initial: 条件初值, onSubmit: (c)=>void }
+   */
+  function mountAdvancedToggle(inputEl, anchorEl, opts) {
+    opts = opts || {};
+    const submit = opts.onSubmit || ((c) => { location.href = buildSpaSearchUrl(c); });
     if (!inputEl || !anchorEl || anchorEl.querySelector('.dbmas-toggle')) return;
 
     const wrap = inputEl.closest('.inp') || inputEl.parentNode;
@@ -414,7 +582,8 @@
         h.appendChild(close);
         panel.appendChild(h);
         panel.appendChild(buildPanelForm({
-          onSubmit: (c) => { location.href = buildSearchUrl(c); },
+          initial: opts.initial,
+          onSubmit: submit,
         }));
         document.body.appendChild(panel);
         window.addEventListener('resize', () => {
@@ -455,7 +624,9 @@
   function initMusicSite() {
     const input = document.querySelector('#inp-query');
     const anchor = document.querySelector('.nav-search');
-    mountAdvancedToggle(input, anchor);
+    mountAdvancedToggle(input, anchor, {
+      onSubmit: (c) => { location.href = buildSpaSearchUrl(c); },
+    });
   }
 
   /* =====================================================================
@@ -566,9 +737,10 @@
     const isMusicSearch = sp.get('cat') === '1003';
 
     // 无论是否高级搜索，都在结果页搜索框上也挂一个入口（方便随时升级为高级搜索）
+    const c0 = readCriteriaFromUrl(sp);
     const modInput = document.querySelector('.mod-search input[name=q]');
     const modAnchor = document.querySelector('.mod-search');
-    mountAdvancedToggle(modInput, modAnchor);
+    mountAdvancedToggle(modInput, modAnchor, { initial: c0 });
 
     const c = readCriteriaFromUrl(sp);
     if (!isMusicSearch || !hasAdvCriteria(c)) return;
@@ -678,12 +850,221 @@
   }
 
   /* =====================================================================
+   * 五·B —— 新版搜索页 search.douban.com/music/subject_search
+   * 该页由服务端把结果 JSON 注入 window.__DATA__，再由 React 渲染；
+   * 翻页只需改 start 参数，且不需要登录态。
+   * ===================================================================== */
+
+  const SPA_PAGE_SIZE = 15;
+  const MAX_SPA_PAGES = 12;          // 最多自动翻 12 页（约 180 条）
+  const SPA_DELAY_MS = 200;          // 翻页间隔，避免请求过快
+
+  /** 等待 React 渲染出结果卡片（最多等 ms 毫秒） */
+  async function waitForSpaCards(ms) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (document.querySelector('#root .item-root')) return true;
+      await sleep(120);
+    }
+    return false;
+  }
+
+  /** 抓取指定页（start 为偏移量） */
+  async function fetchSpaPage(q, start) {
+    const p = new URLSearchParams({ search_text: q, cat: '1003', start: String(start) });
+    const resp = await fetch(SPA_SEARCH_PATH + '?' + p.toString(), {
+      credentials: 'same-origin',
+    });
+    if (!resp.ok) return null;
+    return extractSpaData(await resp.text());
+  }
+
+  /** 按关键词汇总结果（自动翻页；登录与否都能翻） */
+  async function collectSpaItems(q, onProgress) {
+    const items = [];
+    const seen = new Set();
+    const push = (data) => {
+      (data && Array.isArray(data.items) ? data.items : []).forEach((raw) => {
+        const it = parseSpaItem(raw);
+        if (!it || seen.has(it.link)) return;
+        seen.add(it.link);
+        items.push(it);
+      });
+    };
+
+    // 首页：若当前页就是 start=0，直接用已注入的 __DATA__，省一次请求
+    const curStart = parseInt(new URLSearchParams(location.search).get('start') || '0', 10);
+    let firstData = null;
+    if (curStart === 0 && window.__DATA__ && Array.isArray(window.__DATA__.items)) {
+      firstData = window.__DATA__;
+    } else if (typeof fetch === 'function') {
+      firstData = await fetchSpaPage(q, 0);
+    }
+    if (!firstData) return { items, total: 0, pages: 0, truncated: false };
+
+    const total = firstData.total || 0;
+    push(firstData);
+
+    let start = SPA_PAGE_SIZE;
+    let pages = 1;
+    while (typeof fetch === 'function' && pages < MAX_SPA_PAGES && start < total) {
+      const d = await fetchSpaPage(q, start);
+      if (!d || !Array.isArray(d.items) || !d.items.length) break;
+      push(d);
+      start += d.items.length || SPA_PAGE_SIZE;
+      pages++;
+      if (onProgress) onProgress(items.length, pages);
+      if (start < total) await sleep(SPA_DELAY_MS);
+    }
+    return { items, total, pages, truncated: start < total };
+  }
+
+  /** 把一批结果并入已有集合（按链接去重） */
+  function mergeSpaItems(target, extra) {
+    const seen = new Set(target.map((i) => i.link));
+    extra.forEach((it) => { if (!seen.has(it.link)) { seen.add(it.link); target.push(it); } });
+  }
+
+  /** 单张结果卡片 */
+  function spaCardNode(it) {
+    const card = document.createElement('div');
+    card.className = 'dbmas-spa-card';
+    const bits = [];
+    if (it.performer) bits.push(it.performer);
+    if (it.date) bits.push(it.date);
+    if (it.genre) bits.push(it.genre);
+    card.innerHTML = `
+      <a class="dbmas-spa-cover" href="${escapeAttr(it.link)}" target="_blank" rel="noreferrer">
+        ${it.cover ? `<img src="${escapeAttr(it.cover)}" alt="${escapeAttr(it.title)}" loading="lazy">`
+                   : '<span class="dbmas-spa-nocover">无封面</span>'}
+      </a>
+      <div class="dbmas-spa-body">
+        <div class="dbmas-spa-title">
+          <a href="${escapeAttr(it.link)}" target="_blank" rel="noreferrer">${escapeHtml(it.title)}</a>
+        </div>
+        ${bits.length ? `<div class="dbmas-spa-meta">${escapeHtml(bits.join(' · '))}</div>` : ''}
+        ${it.abstract ? `<div class="dbmas-spa-abs">${escapeHtml(it.abstract)}</div>` : ''}
+        <div class="dbmas-spa-rating">
+          ${it.rating
+            ? `<b>${escapeHtml(it.rating)}</b>${it.votes ? `<span>${escapeHtml(it.votes)} 人评价</span>` : ''}`
+            : '<span class="dbmas-norating">暂无评分</span>'}
+        </div>
+      </div>`;
+    return card;
+  }
+
+  async function initSpaResultsPage() {
+    const sp = new URLSearchParams(location.search);
+    const c = readCriteriaFromUrl(sp);
+
+    // 新版搜索页的搜索框就是顶部导航的 #inp-query
+    const navInput = document.querySelector('#inp-query');
+    const navAnchor = document.querySelector('.nav-search') || document.querySelector('#db-nav-music');
+    mountAdvancedToggle(navInput, navAnchor, {
+      initial: c,
+      onSubmit: (nc) => { location.href = buildSpaSearchUrl(nc); },
+    });
+
+    if (!hasAdvCriteria(c)) return;   // 普通搜索：只挂入口，不干预
+
+    await waitForSpaCards(4000);      // 等 React 渲染完，好定位原生列表
+
+    const root = document.querySelector('#root');
+    const wrapper = (root && root.parentElement) || document.querySelector('#wrapper') || document.body;
+
+    // ---- 结果容器 ----
+    const box = document.createElement('div');
+    box.id = 'dbmas-spa';
+    const bar = buildStatusBar(c);
+    box.appendChild(bar);
+    const listEl = document.createElement('div');
+    listEl.className = 'dbmas-spa-list';
+    box.appendChild(listEl);
+    wrapper.insertBefore(box, root || wrapper.firstChild);
+
+    // ---- 隐藏原生结果列表与分页（保留分类 tab 等其余原生 UI）----
+    const cards = document.querySelectorAll('#root .item-root');
+    if (cards.length) {
+      const listContainer = cards[0].parentElement;
+      if (listContainer) listContainer.style.display = 'none';
+    } else if (root) {
+      root.style.display = 'none';
+    }
+    document.querySelectorAll('#root [class*="pagin"]').forEach((el) => {
+      el.style.display = 'none';
+    });
+
+    const statEl = bar.querySelector('.dbmas-stat');
+    const noteEl = bar.querySelector('.dbmas-note');
+
+    bar.querySelector('.dbmas-reset').addEventListener('click', () => {
+      const p = new URLSearchParams(location.search);
+      ['adv_title', 'adv_performer', 'adv_year', 'adv_genre', 'adv_tmode', 'adv_pmode', 'start']
+        .forEach((k) => p.delete(k));
+      location.href = SPA_SEARCH_PATH + '?' + p.toString();
+    });
+    bar.querySelector('.dbmas-edit').addEventListener('click', () => {
+      let form = bar.querySelector('form.dbmas-inline');
+      if (form) { form.remove(); return; }
+      form = buildPanelForm({
+        initial: c,
+        onSubmit: (nc) => { location.href = buildSpaSearchUrl(nc); },
+      });
+      form.classList.add('dbmas-inline');
+      bar.appendChild(form);
+    });
+
+    // ---- 汇总并过滤 ----
+    const q = sp.get('search_text') || '';
+    statEl.textContent = '正在加载结果…';
+    const { items, total, pages, truncated } =
+      await collectSpaItems(q, (n, p) => { statEl.textContent = `已加载 ${n} 条（第 ${p} 页）…`; });
+
+    let matched = items.filter((it) => itemMatches(it, c));
+    let extended = false;
+    if (!matched.length && c.title && c.performer) {
+      noteEl.style.display = 'block';
+      noteEl.textContent = '组合关键词命中为 0，正在按「作品名」「表演者」分别扩展搜索…';
+      for (const term of [c.title, c.performer]) {
+        const r = await collectSpaItems(term);
+        mergeSpaItems(items, r.items);
+      }
+      matched = items.filter((it) => itemMatches(it, c));
+      extended = items.length > 0;
+    }
+
+    // ---- 渲染 ----
+    if (!matched.length) {
+      const empty = document.createElement('div');
+      empty.className = 'dbmas-empty';
+      empty.textContent = items.length === 0
+        ? '豆瓣搜索本身未返回任何结果，请检查关键词。'
+        : '没有满足全部条件的条目。可尝试：将「精确」改为「包含」、放宽年份条件、或只填表演者。';
+      listEl.appendChild(empty);
+    } else {
+      matched.forEach((it) => listEl.appendChild(spaCardNode(it)));
+    }
+
+    statEl.textContent = `命中 ${matched.length} 条 / 已加载 ${items.length} 条` +
+      (total ? `（豆瓣共 ${total} 条${truncated ? '，已达自动翻页上限' : ''}）` : '');
+    if (extended) {
+      noteEl.style.display = 'block';
+      noteEl.textContent = '已自动扩展搜索范围（按作品名 / 表演者分别检索并合并去重）。';
+    } else if (truncated) {
+      noteEl.style.display = 'block';
+      noteEl.textContent = `已自动加载 ${pages} 页。结果较多时建议缩小关键词范围以提高命中率。`;
+    }
+  }
+
+  /* =====================================================================
    * 六、启动
    * ===================================================================== */
 
   injectCSS();
   if (location.host === 'music.douban.com') {
     initMusicSite();
+  } else if (location.host === 'search.douban.com') {
+    initSpaResultsPage();
   } else if (location.host === 'www.douban.com' && location.pathname === '/search') {
     initResultsPage();
   }
